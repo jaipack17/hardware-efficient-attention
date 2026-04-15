@@ -82,7 +82,7 @@ $$
 
 As you can see, memory scales linearly with sequence length. When the context is large, it becomes a serious problem. For a 30 billion parameter model with batch size 128 and sequence length 1024, the KV cache alone results in 180GB of memory usage. At 128K tokens on a single request with Llama 3 70B, it hits around 40GB. As context lengths push towards a million tokens, the KV cache dominates GPU memory, leaving little room for anything else and becoming the primary bottleneck in long-context inference. This introduces the scope of optimizing the prefill and decode phase, exploring the trade-off between compute and memory efficiency.
 
-# Under the Hood of a GPU
+# 2. Under the Hood of a GPU
 ## 2.1 GPU Architecture
 
 Modern GPUs have a hierarchical hardware architecture and execution models. They have multiple levels of memory (Memory hierarchy) where bandwidth and capacity are inversely related. The largest memory pool is the off-chip global memory (GMEM) also called the High-Bandwidth Memory (HBM) housing around 40-80GB VRAM. This memory is available to all Streaming Multiprocessors (around 100+ SMs in modern GPUs) but is relatively slow to read and write from.
