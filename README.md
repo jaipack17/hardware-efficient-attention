@@ -251,4 +251,188 @@ The advantage of the TMA is that it frees the threads to execute other independe
 
 To improve GPU resource utilization in FlashAttention-2 for the Hopper Architecture (eg. H100), [FlashAttention-3 (2024)](https://arxiv.org/abs/2407.08608) was introduced. It uses asynchronous execution at 2 levels of the attention algorithm. Recall that in FlashAttention-2, the outer-loop parallely goes over different query blocks and the inner-loop goes sequentially through the KV blocks. We would load the Query, then in iteration we would load KV blocks, perform GEMM and softmax operations ([Section 3.1](#31-tiling-and-online-softmax)). An effective way to parallelise the loading of the KV blocks for a query and computation of the attention output is to specialise different warps to either work on loading/writing data (producer warpgroups) or computing attention (consumer warpgroups). 
 
-<img width="1279" height="410" alt="image" src="https://github.com/user-attachments/assets/5b108013-ff61-4e54-86df-9abe8c758ef7" />
+<div align="center">
+<img width="60%" alt="image" src="https://github.com/user-attachments/assets/5b108013-ff61-4e54-86df-9abe8c758ef7" />
+  <br/>
+  <p><i>Fig. Warp-specialization helps overlap compute and memory loads which speeds up iterations since memory loads of iteration j have already been done in iteration j-1.</i></p>
+</div>
+
+The producer warp groups use a circular SMEM buffer with ‘k’ stages. This means the KV blocks for at most k iterations can be loaded alongside each other. If the 
+$(j mod k)^{th}$ stage of the buffer is occupied, the KV blocks of the $j^{th}$ iteration have to wait for the computation of the KV blocks in this space to be completed, and this space to be freed from the buffer. These producer warps issue instructions to the TMA for loading these queries and kv blocks asynchronously, and once these tensors are loaded, the consumer warp groups are notified for a particular iteration.
+
+<div align="center">
+<img width="60%" alt="image" src="https://github.com/user-attachments/assets/c63a1b67-2dba-433e-9500-d1062b070953" />
+  <br/>
+  <p><i>Fig. Circular SMEM Buffer with k=4 stages holding at most 4 KV Blocks at a time.</i></p>
+</div>
+
+The consumer warps wait until the required query block has been loaded into the shared memory before running iterations on the kv blocks. At every $j^{th}$ iteration, the warps wait for block $K_j$ to load, GEMM is performed to compute matrix S using the async Warp Group Matrix Multiply Add (WGMMA) instruction. Then after computing softmax outputs, the warps wait for block $V_j$ to load followed by updating attention output for the query. This is similar to tiling, but here we have different warps for loading blocks and computing outputs. 
+
+In addition to this, we can see that in the consumer warps we have a sequential and dependent computation process where a GEMM is followed by non-mat-mul softmax operations followed by another GEMM. GEMM operations are computed way faster than softmax operations (which involve the exponential function) because of the high-speed tensor cores. This means a big portion of the time to compute attention is taken up by these softmax operations. We can try to overlap the softmax computation of one warpgroup with the GEMM of another warpgroup. FlashAttention-3 uses synchronization barriers of the CUDA API to schedule the GEMMs (GEMM1 - $PV$ of one iteration, and GEMM0 - $QK^T$ of the next iteration) of warpgroup 1 before the GEMMs of warpgroup 2. As a result, the softmax of warpgroup 1 will be scheduled while warpgroup 2 is performing its GEMMs. Then the roles swap, with warpgroup 2 doing softmax while warpgroup 1 doing GEMMs. This is called **ping-pong scheduling**, best explained in the FlashAttention-3 paper’s Section 3.1.
+
+<div align="center">
+<img width="60%" alt="image" src="https://github.com/user-attachments/assets/c6200827-4758-4f30-a58d-817d28d04525" />
+<br/>
+  <p><i>Fig. FlashAttention-3 Section 3.1</i></p>
+</div>
+
+Even within each warpgroup, it is possible to overlap the softmax and GEMM operations by pipelining across different iterations using more buffers (cyclic) in registers. 
+
+<div align="center">
+<img width="60%" alt="image" src="https://github.com/user-attachments/assets/a041a2f6-0482-4b07-8672-7a698c9195d1" />
+<br/>
+  <p><i>Fig. FlashAttention-3 Section 3.2</i></p>
+</div>
+
+Since this method requires additional registers for storing $S_{next}$, for higher block sizes it is possible that high register pressure leads to register spilling which hurts performance. It’s thus important to find the optimum amount of parallelism to maximize performance. A lot of these asynchronous execution techniques are used in FlashInfer (2025) to make FlashAttention-3 efficient for inference workloads. They utilize the TMA to hide the latency of KVCache fetching behind their exact attention computations. There exist some limitations to the TMA like the lack of support of non-affine memory access patterns which doesn’t allow asynchronous fetching of sparse KVCache blocks. Thus for sparse attention, FlashInfer relies on the normal Ampere architecture style transfer of data from global memory to shared memory.
+
+## 3.4 Reducing Memory Fragmentation
+
+Before **PagedAttention**, systems like [Orca (2022)](https://www.usenix.org/conference/osdi22/presentation/yu) and [FasterTransformer (2022)](https://github.com/NVIDIA/FasterTransformer) allocated KV cache memory statically, as a contiguous 4D tensor of shape [B,L,H,D] where L is the maximum context length the model supports. For a model like Yi-34B that supports 200K tokens, this means reserving 200K worth of KV cache per request in the batch, even if the actual request generates only 415 tokens on average. This causes severe internal fragmentation where most of the reserved memory sits unused, directly limiting how many requests can be batched simultaneously and therefore limiting throughput.
+
+Inspired by OS virtual memory and demand paging, [vLLM (2023)](https://arxiv.org/abs/2309.06180) introduced PagedAttention. Instead of one contiguous block per request, the KV cache is split into fixed-size blocks called pages, each storing KV data for a fixed number of tokens (typically 16-32). A block table per request maps logical token positions to physical memory locations, exactly like a page table in an OS. 
+
+<div align="center">
+<img width="60%" alt="image" src="https://github.com/user-attachments/assets/a2e00513-c7b3-4a37-8b8c-f67dc7e9dce5" />
+<br/>
+  <p><i>Fig. Efficient Memory Management for Large Language Model Serving with PagedAttention Section 4.2</i></p>
+</div>
+
+Memory is only allocated when a previously allocated block fills up and the model needs to continue generating, not upfront. This reduces fragmentation from 60-80% to below 4%. PagedAttention also enables memory sharing across requests. Sequences sharing a common prefix like a system prompt can share the same physical KV blocks via copy-on-write, only duplicating when a sequence diverges. PagedAttention solves physical memory fragmentation but introduces a new problem in the process. It makes the KV cache non-contiguous in virtual memory. Conventional attention kernels assume K and V are contiguous tensors, and PagedAttention breaks this assumption, requiring every attention kernel to be rewritten to handle non-contiguous block-based memory access. This creates three concrete problems: kernel rewrites add implementation complexity, a memory manager must be maintained in the serving framework to stitch together virtual memory blocks, and block table lookups add runtime overhead on both CPU and GPU. The empirical evidence is stark. vLLM's PagedAttention kernel is up to 2.8x slower than FlashAttention-2's standard kernel. FlashAttention-2's paged prefill kernel is up to 37% slower than the non-paged version. FlashInfer's paged prefill kernel is up to 42% slower. FlashAttention-3 for Hopper was not even released with PagedAttention support at all.
+
+[vAttention (2025)](https://arxiv.org/abs/2405.04437) addresses these issues by leveraging [CUDA Virtual Memory Management (VMM) APIs](https://docs.nvidia.com/cuda/cuda-programming-guide/04-special-topics/virtual-memory-management.html) to decouple virtual and physical memory allocation. Its core insight is that the fragmentation problem lives in physical memory, not virtual memory, so there is no reason to break virtual memory contiguity to fix it. This is exactly how OS demand paging works, but GPU runtimes historically did not expose this capability. It reserves a large contiguous virtual address space for the KV cache upfront so kernels see contiguous memory and need no modification, but only commits physical memory pages on demand as tokens are generated. When a request completes, physical pages are released while the virtual address reservation stays intact for reuse.
+
+<div align="center">
+<img width="75%" alt="image" src="https://github.com/user-attachments/assets/ee61ba29-5a8a-4109-a912-f4f9ed246038" />
+</div>
+
+Two key engineering challenges had to be solved. First, CUDA VMM API calls involve a round trip to the OS kernel which adds latency. vAttention hides this by overlapping memory allocation with compute (**asynchronous execution**), opportunistically pre-allocating pages slightly ahead of when they are needed, and deferring reclamation. Second, CUDA only supports allocation at 2MB page granularity by default, which itself causes fragmentation for small requests. vAttention modifies the open-source CUDA unified virtual memory driver to add support for 64KB pages.
+
+## 3.5 Greater Arithmetic Intensity and Parallel Scalability
+
+Even with perfect SM occupancy, the decoding step is fundamentally memory-bound because every token generation requires loading the entire KV cache from HBM. The arithmetic intensity of standard MHA during decoding is roughly 1 FLOP per byte, far below the H100's compute roofline of ~295 FLOPs/byte, meaning GPU utilization can drop as low as 7%.  Hardware FLOPs have scaled by ~3x every two years while HBM bandwidth only grows at ~1.6x over the same period, so this gap is only widening.
+
+Prior inference-aware attention variants tried to address this. [Multi-Query Attention](https://arxiv.org/abs/1911.02150) (MQA) reduces the KV cache to a single shared head across all query heads, boosting arithmetic intensity by approximately the number of heads ($h_q$) but at the cost of model quality. [Grouped-Query Attention](https://arxiv.org/abs/2305.13245) (GQA) groups query heads to share a KV head, improving arithmetic intensity proportionally to the group size ($g_q$​) while scaling efficiently across devices, but with a moderate tensor parallelism degree each GPU still stores a sizable KV cache. [Multi-head Latent Attention](https://arxiv.org/abs/2502.07864) (MLA), introduced by DeepSeek, compresses each token's hidden state into a low-rank latent vector $c^{KV}$ of dimension $d_c=4d_h$​, caches only this vector, and absorbs the up-projection matrices $W^{UK}$​ and $W^{UV}$​ into the query and output projection matrices respectively during decoding. This means keys and values never materialize explicitly and attention is computed directly against the cached latent, effectively doubling arithmetic intensity relative to MQA. However MLA's single latent head cannot be sharded across devices, it must be replicated on every GPU, limiting parallel scalability.
+
+[Hardware-Efficient Attention for Fast Decoding (2025)](https://arxiv.org/abs/2505.21487) directly addresses this gap by redesigning attention to do more computation per byte loaded from memory, without sacrificing model quality or parallel scalability. The paper defines group size $g_q$ as the number of query heads per distinct KV head, which largely determines arithmetic intensity. Two variants are proposed.
+- Grouped-Tied Attention (GTA), ties the key and value states into a single shared projection. A single projection $W_{KV}$​ produces one tied vector used as the value. For the key, half the head dimension comes from this tied vector with no positional encoding applied, and the other half comes from a separate single-head projection where [RoPE](https://arxiv.org/abs/2104.09864) is applied and broadcast to all heads in the group. This halves the KV cache and doubles arithmetic intensity relative to GQA at the same group size from approximately $g_q​$ to $2g_q$, while preserving GQA's grouping structure for efficient multi-device sharding.
+
+- The second, Grouped Latent Attention (GLA), extends MLA by splitting its single large latent into $m_{kv}$​ smaller heads each of dimension $2d_h/m_{kv}$​. For GLA-2 where $m_{kv}=2$, two latent heads of dimension $2d_h$​ are cached instead of one of dimension $4d_h$​. As shown in the figure below, different devices can now be shared over different latent heads without replication, fixing MLA's parallelism problem while maintaining arithmetic intensity of approximately $2g_q$​.
+
+<div align="center">
+  <img width="65%" alt="image" src="https://github.com/user-attachments/assets/9d4afb1f-26af-43bf-ab28-f42c5422f03f" />
+</div>
+
+Both variants use asynchronous software pipelining and warp specialization similar to FlashAttention-3 to overlap compute with memory transfers, and a cooperative offset calculator for paged KV, keeping tensor cores fully loaded and pushing the kernels from memory-bound towards compute-bound. GLA matches MLA quality and the optimized GLA kernel is up to 2x faster than [FlashMLA](https://github.com/deepseek-ai/FlashMLA) in speculative decoding. In online serving benchmarks, GLA reduces end-to-end latency and increases throughput by up to 2x. However, GTA's tying of keys and values is a strong constraint that may hurt tasks where keys and values benefit from capturing different aspects of the input. GLA's quality advantage over MLA narrows at smaller model scales. The speedup over FlashMLA (the optimized MLA kernel) is most pronounced when query length exceeds 1, meaning single token standard decoding sees less benefit compared to speculative decoding settings.
+
+## 3.6 Hardware Aligned Sparse Attention
+
+### 3.6.1 About Sparsity of Attention and Sparse Attention methods
+
+Analysis of attention patterns in transformer models has shown that attention distribution in transformers is heavily skewed. Only a small subset of tokens actually contributes to most of the attention mass. This behaviour can be visualized via attention heatmaps across layers and heads. 
+
+| <img src="https://github.com/user-attachments/assets/73d142e6-1e1c-4fca-9ad1-775c588aa124" width="150" /> | <img src="https://github.com/user-attachments/assets/97e221e2-2476-43b9-856c-f851aba6ccbe" width="150" /> | <img src="https://github.com/user-attachments/assets/1aee6b26-2c5f-416e-a8aa-fbbface3ae46" width="150" /> | <img src="https://github.com/user-attachments/assets/eae7f34f-d7e8-49a7-ae70-4c9ed47e6521" width="150" /> |
+| :---: | :---: | :---: | :---: |
+
+<div align="center">
+  <br/>
+  <p><i>Fig. Attention Heatmaps of different heads in GPT-2 for an example sequence</i></p>
+</div>
+
+As seen in the heatmaps, attention is not uniformly distributed across tokens. Instead most of the tokens have attention close to zero with only a few regions where certain tokens receive significantly higher attention. This indicates that only a few tokens contribute meaningfully to the attention computation. This observation motivated sparse attention methods where instead of calculating the attention scores for all the token pairs, we only calculate them for a subset of the relevant tokens.
+- A common approach is to directly estimate token importance and select only a subset of tokens for each query. [TokenSelect (2024)](https://arxiv.org/abs/2411.02886) works at the token level and tries to directly identify important tokens instead of relying on blocks. It computes query-key scores for each head and then combines them using a soft voting scheme, where each head contributes to the importance of a token. This avoids domination by a few heads and leads to a more balanced selection. It also reuses previous selections during decoding by exploiting similarity between consecutive queries, which reduces overhead. The result is a reasonably precise and adaptive selection mechanism, but since it depends on current query-key scores, it can still miss tokens that become important later.
+- [xAttention (2025)](https://arxiv.org/abs/2503.16428) operates at the block level. Instead of scoring individual tokens, it divides attention into blocks and estimates block importance using a trick i.e. summing the anti-diagonal values of each block. Blocks with higher sums are treated as more important and selected. This avoids expensive scoring mechanisms and keeps things efficient, but the selection is still approximate and depends on how well this proxy captures true importance.
+-  [MoBA (2025)](https://arxiv.org/html/2502.13189v1) by DeepSeek also works with blocks but introduces a more dynamic selection process. It divides queries and KV cache into fixed-size blocks and computes an affinity score between a query and each block using inner products with pooled key vectors. Based on this, it selects the top-k blocks for each query and computes attention only within those blocks. This is inspired by mixture-of-experts style routing and allows different queries to attend to different regions. However, it works best in prefill and often requires switching back to full attention in later stages.
+
+### 3.6.2 Why Naive Sparsity is Not Enough
+
+The sparse attention methods reduce the number of tokens each query attends to, lowering theoretical FLOPs. But it does not automatically translate to real speedups. How the modern GPU hardware is working determines the gap between how much these sparse attention methods save on paper and how much they actually save in practice. GPUs load data from HBM in contiguous chunks. When naive sparse attention selects arbitrary individual tokens to attend to, those tokens are scattered across memory. The GPU still has to load the entire memory block containing that token even if it only needs one value from it, so you don't actually reduce memory traffic proportionally to the number of tokens you skip. Real speedup only comes when you skip entire contiguous blocks of tokens at once, because then you can skip entire memory accesses. This is why block-sparse attention is hardware-aligned but token-level sparse attention is not.
+
+Most sparse attention methods work either only during the prefill stage (like [MInference (2024)](https://arxiv.org/abs/2407.02490)) or during the decode stage (like [H2O (2023)](https://arxiv.org/abs/2306.14048)). Therefore, these methods only apply sparsity to a single phase of the inference stage. At least one phase remains at full cost compared to full attention.  Post-training sparsity applied to a pretrained dense model forces deviations from the optimization trajectory. The model was never trained to work with sparse attention, so you lose performance. Top 20% attention by score only covers 70% of total attention weight so the “important" tokens you keep are not the same as what the model actually needs.
+
+Most models are still trained on full causal attention, and sparse attention is usually only used during inference. This creates a mismatch between what models have actually learned and how models are actually working at test time. Together, these limitations reveal that sparsity alone is not enough. What matters is whether the sparsity pattern is structured, trainable, and aligned with how the hardware actually processes memory.
+
+### 3.6.3 Hardware Aligned Sparse Attention Methods
+
+The following methods address these gaps by designing sparsity with hardware constraints and training in mind from the start. 
+
+We first look at methods that combine hierarchical sparse attention with native training support. [Native Sparse Attention](https://arxiv.org/abs/2502.11089) (2025) (NSA) by DeepSeek does this by first doing a course-grained token compression, the key sequence is divided into blocks of length $l=32$ with a sliding stride $d=16$ so blocks slightly overlap, preventing information loss at boundaries, each block of keys is passed through a learnable MLP $\Phi$ with intra-block positional encoding to produce a single compressed key that summarizes the entire block, with an analogous compression for values. The query then attends over these compressed representations. After that, it does a fine-grained token selection based on these compressions, NSA uses the attention scores from the compressed branch to estimate which original blocks are most important to the current query. The top-n blocks ($n=16$, including 1 initial block and 2 local blocks) are selected and retained in their original uncompressed form with block size $l′=64$. The query then attends to these selected blocks in original detail. This is how fine-grained, query-specific information is recovered that compression might have lost. Critically, blockwise selection is used rather than token-level selection since GPUs have much higher throughput for contiguous block access than random index-based reads, and it enables Tensor Core utilization. The newest $w=512$ tokens are kept as a standard local attention window. This handles the immediate local context and it would otherwise dominate the other branches if not separated. The outputs of all three branches are combined via a learned gating MLP and a sigmoid activation, that takes the query as input and produces three gate scores, one for each branch. The final output is a weighted sum of the output of each branch multiplied by the gate score for each branch.
+
+<div align="center">
+  <img width="75%" alt="image" src="https://github.com/user-attachments/assets/e154f4cf-4642-44df-838a-6a2cdc801f85" />
+  <br/>
+  <p><i>Fig. Native Sparse Attention: Hardware-Aligned and Natively Trainable Sparse Attention. Section 1.</i></p>
+</div>
+
+Standard sparse attention has low arithmetic intensity because you load large blocks of KV but skip computation, wasting memory bandwidth. NSA's kernel design uses tiling ensures all loaded KV data is actually used by loading queries by GQA groups so all query heads in a group share the same KV load. This maximizes the FLOPs per byte of memory access.
+
+<div align="center">
+  <img width="65%" height="305" alt="image" src="https://github.com/user-attachments/assets/4201a745-9b1d-4b23-8ef0-b47efaee8cfb" />
+  <br/>
+  <p><i>Fig. Native Sparse Attention: Hardware-Aligned and Natively Trainable Sparse Attention. Section 3.4 Kernel Design.</i></p>
+</div>
+
+NSA provides efficient backward pass operators for both the compression MLP and the blockwise selection, enabling gradients to flow through the entire sparse attention mechanism. This is what makes NSA natively trainable rather than a post-training inference-only method. NSA matches or exceeds full attention on general benchmarks, [LongBench](https://arxiv.org/abs/2308.14508), and chain-of-thought reasoning. However, the three-branch design adds implementation complexity. The compression MLP adds a small amount of extra parameters and compute overhead. Performance advantage over full attention narrows at shorter sequence lengths.
+
+Another method that does this is [Trainable Dynamic Mask Sparse Attention (2025)](https://arxiv.org/abs/2508.02124) (DMA) first identifies that long-context tasks naturally exhibit three types of sparsity. Copy tasks need positional sparsity (fixed-distance relationships), select tasks need content sparsity (semantically relevant tokens), and induce tasks need associative sparsity (query-relevant KV pairs). Rather than imposing one fixed pattern, this method learns to identify and leverage all three. Unlike NSA which uses attention scores to select blocks, DMA generates masks from the value matrix V. Dynamic weights are computed as: 
+
+$$
+\huge{\delta = e^{(\tau(v \cdot \Delta) \times A)} \quad \text{where} \quad \Delta \in \mathbb{R}^{n_h \times d_h \times n_h} \quad A \in \mathbb{R}^{n_h} \quad \delta \in \mathbb{R}^{n_h \times n}}
+$$
+
+where $\Delta$ is a learnable sampling weight matrix acting like a forget gate, $A$ is the per-head gating co-efficient, $\tau(v \cdot \Delta)$ is a non-negative activation function ensuring weights emphasize rather than suppress signals and $\delta$ contain the final scores. The final mask combines these dynamic weights with causal masking: 
+
+$$
+\huge{
+\begin{aligned}
+m_t &= f(\delta) \quad \text{where} \quad m_t \in \mathbb{R}^{n\_h \times n} \\\\
+&= \begin{bmatrix} 
+f(\sum_{j=1}^{n} \delta_{1,j}) \\\\ 
+f(\sum_{j=1}^{n} \delta_{2,j}) \\\\ 
+\vdots \\\\ 
+f(\sum_{j=1}^{n} \delta_{n\_h,j}) 
+\end{bmatrix} \quad \text{where} \quad f(\delta_{n\_h,j}) = 
+\begin{cases} 
+\delta_{n\_h,j} & \text{if } \delta_{n\_h,j} \in top_w(\delta_{n\_h}) \\\\ 
+-\infty & \text{otherwise} 
+\end{cases}
+\end{aligned}
+}
+$$
+
+Scores within the $top_w$ are retained to preserve the gradient flow, while all other scores are set to $-\infty$, effectively nullifying their contribution in the subsequent softmax operation. This creates a unique mask per attention head, enabling diverse patterns across heads. Attention is then computed as:
+
+$$
+\huge{
+o_t = \text{softmax}\left( \frac{q_t k^\top}{\sqrt{d_h}} \circ m_t \right)v \quad \text{where} \quad p_t \in \mathbb{R}^{n\_h \times n} \quad o_t \in \mathbb{R}^{n\_h \times d\_h}
+}
+$$
+
+When mask values are $-\infty$, softmax outputs exactly zero, so those computations can be completely skipped. DMA proves this is safe for both forward and backward passes as gradients are also exactly zero for masked positions, so gradient flow is fully intact. This reduces FLOPs from $O(n^2d_h)$ to $O(nwd_h)$. From 80M to 1.7B parameters, DMA consistently achieves better perplexity than MHA, Sliding Window Attention (SWA), MLA, and NSA. Up to 10x speedup at long sequences. Superior performance on needle-in-a-haystack and multi-query associative recall at 512 KV pairs. However, the mask generation from value vectors adds a forward pass dependency that complicates parallelism. Performance advantage over NSA is modest on standard benchmarks. The top-w window size is a fixed hyperparameter that may not adapt optimally across all task types.
+
+Another idea is to unify static and dynamic sparsity for serving. [LServe (2025)](https://arxiv.org/abs/2502.14866) is a method that does it, it builds upon a key observation that when Llama-3-8B runs with 256k input tokens and 20k output tokens, prefill takes 116 seconds but decode takes 540 seconds, almost 5x longer. So you need to optimize both stages, not just one. Prior methods either tackle prefill or decode but not both in a unified framework. LServe converts half the attention heads into “streaming heads” with Λ-shaped masks, these heads only attend to initial tokens and a local sliding window, making them nearly free to compute. The other half remain full attention heads. This static conversion is done offline once and applies to both prefill and decode. For the full attention heads, LServe observes that only a constant number of KV pages (~4096) is needed to maintain long-context capability regardless of context length. It designs a hierarchical page selector that identifies important KV pages per query token based on query-centric similarity. Crucially, selection results are reused across adjacent tokens, reducing page selection overhead. The key contribution is fusing static sparsity, dynamic sparsity, and KV cache quantization into a single GPU kernel for decode. This means speedups multiply, not add. You get static sparsity savings, dynamic sparsity savings AND quantization savings in one kernel pass. In Prefilling, it achieved up to 2.9x speedup over vLLM. And in Decoding, it achieved 1.3-2.1x speedup over vLLM. It is compatible with reasoning models and matches a dense baseline on **DeepSeek-R1-Distill-Llama-8B**, tested at context lengths up to 512k tokens. However, the static head conversion requires offline profiling to identify which heads to convert. Dynamic page selection still has overhead even with 4x reduction from reuse. The constant KV page assumption may not hold for all task types.
+
+There are methods which use Adaptive Sparse Attention via Learned Activations. [AdaSplash (2025)](https://arxiv.org/abs/2502.12082) is a method which uses this. Softmax always assigns nonzero probability to every token. For long contexts this causes attention dispersion i.e small probabilities accumulate and dilute the attention signal. $\alpha-entmax$ is a differentiable alternative that assigns exact zero probability to irrelevant tokens, making sparsity emerge naturally from the model rather than being imposed. But prior implementations of $\alpha-entmax$ didn't exploit this sparsity for actual speedup because you still need to compute the full $QK^T$ matrix before applying the transformation. $\alpha-entmax$:
+
+<div align="center">
+  <img width="60%" alt="image" src="https://github.com/user-attachments/assets/eac1f93c-ceb9-4da4-a227-3596116dd8b8" />
+  <br/>
+  <p><i>Fig. AdaSplash (2025) Section 2.4. Sparse Attention</i></p>
+  <img width="60%" alt="image" src="https://github.com/user-attachments/assets/329c1e62-9f69-41cd-8892-6bf7129add55" />
+  <br/>
+  <p><i>Fig. AdaSplash (2025) Section 3.1 alpha-entmax Computation</i></p>
+</div>
+
+Prior work used bisection which converges linearly. AdaSplash combines [bisection](https://www.google.com/search?client=safari&rls=en&q=bisection&ie=UTF-8&oe=UTF-8) with [Halley's method](https://en.wikipedia.org/wiki/Halley%27s_method), when Halley's update falls within the current bisection bounds, use it (cubic convergence), otherwise fall back to bisection. This gives 7x fewer iterations in practice. AdaSplash also implements block-wise sparse attention in a custom Triton kernel. After computing attention scores for a block, it applies  $\alpha-entmax$ and skips blocks where all scores fall below the threshold. Uses recomputation in the backward pass (like FlashAttention) to avoid storing the full attention matrix. At high sparsity (>70%), AdaSplash outperforms FlashAttention-2 in runtime. At 50% sparsity it roughly matches FlashAttention-2. It has a strong performance on [RoBERTa](https://arxiv.org/abs/1907.11692), [ModernBERT](https://arxiv.org/abs/2412.13663), and GPT-2 tasks. But a limitation is that Sparsity is data-dependent and unpredictable at runtime. You can't know in advance how sparse a given input will be, making it harder to guarantee speedups. At low sparsity it's slower than FlashAttention-2. 
+
+# 4. Applications in Long-context Modelling
+
+The hardware-efficient optimizations discussed throughout this blog enable advanced long-context models to function efficiently. The first major application area in long-context modelling is foundational model training and the expansion of base context limits. When training language models, exposing them to large sequences traditionally leads to high memory usage, making it difficult to process entire books or high-resolution inputs. FlashAttention revolutionized this area by fundamentally optimizing how memory is accessed during computation, significantly reducing the overall memory footprint. In practice, this allows developers to train models on vastly larger context windows in a fraction of the time. The resulting models inherently comprehend longer documents better and can successfully solve complex visual and sequential tasks that were previously deemed near impossible due to strict sequence length constraints.
+
+In real-time interactive serving, deployed models must handle highly variable requests from multiple concurrent users. Conversational histories fluctuate unpredictably, which can cause severe delays and inefficiencies. FlashInfer addresses this by dynamically balancing computational workloads across the hardware, leading to a noticeable reduction in the initial wait time for users and the delay between each generated word. It maintains this high readiness even when processing continuous, infinite streams of text or generating multiple responses simultaneously. Similarly, the Grouped Latent Attention and Grouped-Tied Attention mechanisms drastically shrink the memory required to store conversational history. This memory reduction allows servers to handle significantly more concurrent requests and deliver higher overall throughput, ensuring smooth and reliable performance in latency-sensitive applications.
+
+The decoding phase presents a unique challenge for long-context applications, often leaving processing cores severely underutilized. LeanAttention guarantees that no part of the system sits idle, delivering a substantial acceleration in text generation. Notably, the speedup becomes increasingly profound as the conversation history grows exceptionally long. Moreover, extracting precise information and conducting complex reasoning over massive documents is of great importance. Traditional models often struggle to find relevant details buried in noise or lose track of logical steps in lengthy derivations. Native Sparse Attention proves highly effective here by learning to inherently filter out irrelevant information from the ground up during the training phase. In practical evaluations, it demonstrates flawless retrieval of deeply hidden facts within massive texts and significantly elevates the model's ability to perform deep, multi-step mathematical reasoning. Complementing this, Dynamic Mask Attention excels in associative recall and long-document tasks by adapting its focus based on the specific content it processes. These methods implement special and efficient kernels that use the techniques described in Section 3 to efficiently compute attention over the selected number of tokens without letting GPU resources sit idle and efficiently managing memory accesses of the selected tokens.
+
+# 5. Conclusion
+
+Scaling LLMs to process millions of tokens exposes severe memory and compute bottlenecks in modern GPUs. Overcoming physical limitations of the GPU requires deeply aligning algorithm design with hardware execution rather than relying on naive implementations. By combining fundamental techniques like tiling, optimal work partitioning with advanced innovations such as asynchronous execution, Virtual Memory Management (VMM), and hardware-aligned sparse attention, developers can maximize GPU utilization and improve memory management. Ultimately, achieving fast, economical long-context inference demands.
