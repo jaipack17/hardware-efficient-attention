@@ -37,7 +37,7 @@ As LLMs scale their context length to more than a million tokens, they run into 
     - [3.6.2. Why Naive Sparsity is Not Enough](#362-why-naive-sparsity-is-not-enough)
     - [3.6.3. Hardware Aligned Sparse Attention Methods](#363-hardware-aligned-sparse-attention-methods)
       
-[4. Application in Long-context Modelling](#4-application-in-long-context-modelling)
+[4. Applications in Long-context Modelling](#4-applications-in-long-context-modelling)
 
 [5. Conclusion](#5-conclusion)
 
