@@ -14,58 +14,32 @@ As LLMs scale their context length to more than a million tokens, they run into 
 
 # Content
 
-<ul class="toc">
-  <li>
-      <span class="section-number">1. </span>Background
-      <ul>
-          <li><span class="section-number">1.1. </span>Attention Mechanism</li>
-          <li><span class="section-number">1.2. </span>Two Phases of LLM Inference</li>
-          <li><span class="section-number">1.3. </span>KV Cache</li>
-      </ul>
-  </li>
-  
-  <li>
-      <span class="section-number">2. </span>Under the Hood of a GPU
-      <ul>
-          <li><span class="section-number">2.1. </span>GPU Architecture</li>
-          <li><span class="section-number">2.2. </span>Areas of Optimization</li>
-          <li><span class="section-number">2.3. </span>KV Cache Management</li>
-      </ul>
-  </li>
-  
-  <li>
-      <span class="section-number">3. </span>Hardware-Efficient Attention
-      <ul>
-          <li><span class="section-number">3.1. </span>Tiling and Online Softmax</li>
-          <li>
-              <span class="section-number">3.2. </span>Optimal Work Partitioning
-              <ul>
-                  <li><span class="section-number">3.2.1. </span>During Prefill Phase</li>
-                  <li><span class="section-number">3.2.2. </span>During Decode Phase</li>
-              </ul>
-          </li>
-          <li><span class="section-number">3.3. </span>Asynchronous Execution and Pipelining</li>
-          <li><span class="section-number">3.4. </span>Reducing Memory Fragmentation</li>
-          <li><span class="section-number">3.5. </span>Greater Arithmetic Intensity and Parallel Scalability</li>
-          <li>
-              <span class="section-number">3.6. </span>Hardware Aligned Sparse Attention
-              <ul>
-                  <li><span class="section-number">3.6.1. </span>About Sparsity of Attention and Sparse Attention Methods</li>
-                  <li><span class="section-number">3.6.2. </span>Why Naive Sparsity is Not Enough</li>
-                  <li><span class="section-number">3.6.3. </span>Hardware Aligned Sparse Attention Methods</li>
-              </ul>
-          </li>
-      </ul>
-  </li>
-  
-  <li>
-      <span class="section-number">4. </span>Application in Long-context Modelling
-  </li>
-  
-  <li>
-      <span class="section-number">5. </span>Conclusion
-  </li>
-</ul>
+[1. Background](#1-background)
+- [1.1. Attention Mechanism](#11-attention-mechanism)
+- [1.2. Two Phases of LLM Inference](#12-two-phases-of-llm-inference)
+- [1.3. KV Cache](#13-kv-cache)
+
+[2. Under the Hood of a GPU](#2-under-the-hood-of-a-gpu)
+- [2.1. GPU Architecture](#21-gpu-architecture)
+- [2.2. Areas of Optimization](#22-areas-of-optimization)
+- [2.3. KV Cache Management](#23-kv-cache-management)
+
+[3. Hardware-Efficient Attention](#3-hardware-efficient-attention)
+- [3.1. Tiling and Online Softmax](#31-tiling-and-online-softmax)
+- [3.2. Optimal Work Partitioning](#32-optimal-work-partitioning)
+    - [3.2.1. During Prefill Phase](#321-during-prefill-phase)
+    -  [3.2.2. During Decode Phase](#322-during-decode-phase)
+- [3.3. Asynchronous Execution and Pipelining](#33-asynchronous-execution-and-pipelining)
+- [3.4. Reducing Memory Fragmentation](#34-reducing-memory-fragmentation)
+- [3.5. Greater Arithmetic Intensity and Parallel Scalability](#35-greater-arithmetic-intensity-and-parallel-scalability)
+- [3.6. Hardware Aligned Sparse Attention](#36-hardware-aligned-sparse-attention)
+    - [3.6.1. About Sparsity of Attention and Sparse Attention Methods](#361-about-sparsity-of-attention-and-sparse-attention-methods)
+    - [3.6.2. Why Naive Sparsity is Not Enough](#362-why-naive-sparsity-is-not-enough)
+    - [3.6.3. Hardware Aligned Sparse Attention Methods](#363-hardware-aligned-sparse-attention-methods)
+      
+[4. Application in Long-context Modelling](#4-application-in-long-context-modelling)
+
+[5. Conclusion](#5-conclusion)
 
 ---
 
